@@ -1,16 +1,22 @@
 import os
-import zipfile
 import re
 import shutil
 import sys
+import threading
+import zipfile
 import zlib
-from pathlib import Path
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
-if len(sys.argv) != 2:
-    print("Usage: python script.py FILE_OR_DIRECTORY_PATH")
-    sys.exit(1)
+from rich.console import Console
+from rich.table import Table
 
-FILE_OR_DIRECTORY_PATH = sys.argv[1]
+console = Console()
+url_counts = defaultdict(int)
+url_counts_lock = threading.Lock()  # Lock for thread-safe operations on the URL count dictionary
+suspicious_files_count = 0
+suspicious_files_lock = threading.Lock()  # Lock for thread-safe incrementing of suspicious files count
+
 
 def extract_urls_from_stream(stream):
     try:
@@ -19,6 +25,7 @@ def extract_urls_from_stream(stream):
         return urls
     except zlib.error:
         return []
+
 
 def process_pdf_file(pdf_path):
     with open(pdf_path, 'rb') as file:
@@ -33,8 +40,24 @@ def process_pdf_file(pdf_path):
 
     return found_urls
 
+
+def check_domain(url):
+    allowed_domains = [
+        'microsoft.com', 'w3.org', 'verisign.com', 'adobe.com', 'openxmlformats.org', 'purl.org',
+        'mozzila.org', 'google.com', 'apache.org', 'mvnrepository.com', 'oracle.com', 'sun.com',
+        'android.com', 'npmjs.org', 'asp.net', 'opengis.net', 'github.com', 'yarnpkg.com',
+        'xceed.com', 'redis.io', 'wikipedia.org', 'github.io', 'facebook.com', 'twitter.com',
+        'linkedin.com', 'instagram.com', 'youtube.com', 'pinterest.com', 'globalsign.net',
+        'thawte.com', 'entrust.net', 'rabbitmq.com', 'couchbase.com', 'couchdb.org','fb.me','libreoffice.org'
+    ]
+    for domain in allowed_domains:
+        if re.search(rf'https?://([a-zA-Z0-9.-]+\.)?{re.escape(domain)}', url):
+            return False
+    return True
+
+
 def decompress_and_scan(file_path):
-    is_suspicious = False
+    is_file_suspicious = False
     temp_dir = "temp_extracted"
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -43,26 +66,32 @@ def decompress_and_scan(file_path):
             zip_ref.extractall(temp_dir)
 
         url_pattern = re.compile(r'https?://\S+')
-        ignored_domains = ['schemas.openxmlformats.org', 'schemas.microsoft.com', 'purl.org', 'w3.org']
 
-        for root, dirs, files in os.walk(temp_dir):
+        for root, _, files in os.walk(temp_dir):
             for file_name in files:
                 extracted_file_path = os.path.join(root, file_name)
                 with open(extracted_file_path, 'r', errors='ignore') as extracted_file:
                     contents = extracted_file.read()
                     urls = url_pattern.findall(contents)
                     for url in urls:
-                        if not any(domain in url for domain in ignored_domains):
-                            print(f"URL Found in {file_path}:\n{url}")
-                            is_suspicious = True
-
+                        if check_domain(url):
+                            console.print(f"URL Found in [bold]{file_path}[/bold]: [red]{url}[/red]", style="bright_yellow")
+                            with url_counts_lock:
+                                url_counts[url] += 1
+                            is_file_suspicious = True
     except Exception as e:
-        print(f"Error processing file {file_path}: {e}")
+        console.print(f"Error processing file {file_path}: {e}", style="red")
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    return is_suspicious
+    if is_file_suspicious:
+        with suspicious_files_lock:
+            global suspicious_files_count
+            suspicious_files_count += 1
+
+    return is_file_suspicious
+
 
 def is_suspicious_file(file_path):
     if file_path.lower().endswith(('.zip', '.docx', '.xlsx', '.pptx')):
@@ -70,29 +99,63 @@ def is_suspicious_file(file_path):
     elif file_path.lower().endswith('.pdf'):
         urls = process_pdf_file(file_path)
         if urls:
-            print(f"The file {file_path} is suspicious. URLs found:")
-            for url in urls:
-                print(url.decode('utf-8', 'ignore').replace('/QXUGUTAENT)', ''))
-            return True
+            suspicious_urls = set(url.decode('utf-8', 'ignore').replace('/QXUGUTAENT)', '') for url in urls if check_domain(url.decode('utf-8', 'ignore')))
+            if suspicious_urls:
+                console.print(f"The file [bold]{file_path}[/bold] is suspicious. URLs found:", style="bright_yellow")
+                for url in suspicious_urls:
+                    console.print(f"[red]{url}[/red]", style="bright_yellow")
+                    with url_counts_lock:
+                        url_counts[url] += 1
+                with suspicious_files_lock:
+                    global suspicious_files_count
+                    suspicious_files_count += 1
+                return True
     return False
 
+
+def print_stats():
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("URL", overflow="fold")
+    table.add_column("Count", justify="right")
+    for url, count in url_counts.items():
+        table.add_row(url, str(count))
+    console.print(table)
+    console.print(f"Suspicious files found: [bold]{suspicious_files_count}[/bold]", style="bright_yellow")
+
+
 def main():
-    if os.path.exists(FILE_OR_DIRECTORY_PATH):
-        if os.path.isfile(FILE_OR_DIRECTORY_PATH):
-            if is_suspicious_file(FILE_OR_DIRECTORY_PATH):
-                print(f"The file {FILE_OR_DIRECTORY_PATH} is suspicious.")
-            else:
-                print(f"The file {FILE_OR_DIRECTORY_PATH} seems normal.")
-        elif os.path.isdir(FILE_OR_DIRECTORY_PATH):
-            for root, dirs, files in os.walk(FILE_OR_DIRECTORY_PATH):
-                for file_name in files:
-                    current_file_path = os.path.join(root, file_name)
-                    if is_suspicious_file(current_file_path):
-                        print(f"The file {current_file_path} is suspicious.")
-                    else:
-                        print(f"The file {current_file_path} seems normal.")
-    else:
-        print(f"The path {FILE_OR_DIRECTORY_PATH} does not exist.")
+    if len(sys.argv) != 2:
+        console.print("Usage: python script.py FILE_OR_DIRECTORY_PATH", style="bright_yellow")
+        sys.exit(1)
+
+    file_or_directory_path = sys.argv[1]
+
+    if not os.path.exists(file_or_directory_path):
+        console.print(f"The path [bold]{file_or_directory_path}[/bold] does not exist.", style="bright_yellow")
+        return
+
+    file_paths = []
+    if os.path.isfile(file_or_directory_path):
+        file_paths.append(file_or_directory_path)
+    elif os.path.isdir(file_or_directory_path):
+        for root, _, files in os.walk(file_or_directory_path):
+            for file_name in files:
+                file_paths.append(os.path.join(root, file_name))
+
+    with ThreadPoolExecutor() as executor:
+        # Use a list comprehension to start the file processing in parallel
+        futures = [executor.submit(is_suspicious_file, file_path) for file_path in file_paths]
+
+        # We don't need the results from the futures, the counts are maintained globally
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                # An error has occurred during processing
+                console.print(f"An error occurred: {e}", style="red")
+
+    print_stats()
+
 
 if __name__ == "__main__":
     main()
